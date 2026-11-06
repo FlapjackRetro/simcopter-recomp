@@ -221,6 +221,32 @@ With `--res 640k x 480k` (k = 2, 3, 4) the game stays in mode 1 and:
   right, on foot stayed 640x480 in the corner.)
 - the window, the mouse and `WM_SIZE` stay in 640x480 (`ddh_gw`/`ddh_gh`).
 
+### 2D drawn straight into the frame buffer
+
+The catalog's highlight box (and its paperclip and coffee stain) came out at
+half position and half size: a Ctrl+F12 trace there shows no Blts at all,
+only four `Lock`s of the frame buffer a frame: 2D code writing pixels in
+640x480 coordinates into what is now a 640k-wide buffer. The 3D renderer
+locks the same buffer, but only through the frame setup that also runs the
+Low/High resolution switch (`call [eax]` at `0x0046449B`, or `0x004643FF` in
+low res), so its return address is on the guest stack. A `Lock` of a k-sized
+surface without it gets a 640x480 copy (top-left pixel of each k x k block);
+`Unlock` writes back the pixels that changed, as k x k blocks. The copy keeps
+the real pitch: the game's surface wrapper remembers the pitch of the last
+`Lock` and the on-foot 3D path reuses it (a pitch of 640 squeezed that view
+into the top half).
+
+The return address alone missed the on-foot view: there the frame function
+locks directly, and the stack shows only exception-handler stubs
+(`0x0044C368`, `0x00430A62`). What every 3D frame does have is a colour
+fill of its view right before the `Lock`; the catalog's locks have none. So
+a `Lock` straight after a fill of the (k-sized) view is 3D too. Those fills
+reach past 640x480, so they are already in pixels and are not scaled again
+(they had been: `(0,0)-(2560,1920)`).
+
+Open: the pilot's size against the world changes with k (to compare at
+640x480, 1280x960, 1920x1440 from the same spot).
+
 ## 12. Open questions
 
 - Whether the Glide probe is `grGlideInit` + `grSstQueryHardware` as the

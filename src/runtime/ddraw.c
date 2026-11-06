@@ -84,6 +84,9 @@ typedef struct Surface {
     DDCOLORKEY ck_src;
     int has_ck_src;
     int k;                               /* addressed in 1/k units (render scale); 0/1: 1:1 */
+    uint8_t* stage;                      /* render scale: a 2D Lock's 640x480 view, while locked */
+    uint8_t* stage0;                     /* ...as it was handed out */
+    int view_cleared;                    /* render scale: the 3D view was just cleared (a 3D Lock follows) */
 } Surface;
 
 typedef struct DDraw {
@@ -357,7 +360,16 @@ static void scale_rect(RECT* r, int k) {
 static HRESULT WINAPI s_Blt(IDirectDrawSurface* p, RECT* dr, IDirectDrawSurface* src, RECT* sr, DWORD f, DDBLTFX* fx) {
     Surface* d = S(p), *s = S(src);
     RECT drc = dr ? *dr : (RECT){ 0, 0, d->w, d->h };
-    if (dr) scale_rect(&drc, d->k);
+    /* Render scale. A rectangle in the game's 640x480 is scaled; the 3D view
+     * is already k-sized (run_lift.py VIEW_SCREEN), so a fill of it, which
+     * reaches past 640x480, is in pixels already. That fill is also how a
+     * 3D frame starts: the renderer clears its view, then Locks (s_Lock). */
+    int view_fill = 0;
+    if (dr && d->k > 1) {
+        if ((f & DDBLT_COLORFILL) && (dr->right > ddh_gw || dr->bottom > ddh_gh)) view_fill = 1;
+        else scale_rect(&drc, d->k);
+    }
+    d->view_cleared = view_fill;
     if (dr && d == g_primary) to_primary((int*)&drc.left, (int*)&drc.top, (int*)&drc.right, (int*)&drc.bottom);
     TRACE("Blt %dx%d%s (%ld,%ld)-(%ld,%ld) <- %dx%d (%ld,%ld)-(%ld,%ld) flags %08lX\n", d->w, d->h,
           d == g_primary ? " primary" : d == (g_primary ? g_primary->back : NULL) ? " back" : "",
@@ -398,6 +410,7 @@ static HRESULT WINAPI s_BltBatch(IDirectDrawSurface* p, DDBLTBATCH* b, DWORD n, 
 static HRESULT WINAPI s_BltFast(IDirectDrawSurface* p, DWORD x, DWORD y, IDirectDrawSurface* src, RECT* sr, DWORD t) {
     Surface* d = S(p), *s = S(src);
     if (d->k > 1 || s->k > 1) {          /* render scale: a stretch, in the game's coordinates */
+        d->view_cleared = 0;
         RECT g = sr ? *sr : (RECT){ 0, 0, s->k > 1 ? s->w / s->k : s->w, s->k > 1 ? s->h / s->k : s->h };
         RECT to = { (LONG)x, (LONG)y, (LONG)x + g.right - g.left, (LONG)y + g.bottom - g.top };
         return s_Blt(p, &to, src, &g, (t & DDBLTFAST_SRCCOLORKEY) ? DDBLT_KEYSRC : 0, NULL);
@@ -500,9 +513,63 @@ static void describe(Surface* s, DDSURFACEDESC* d) {
 static HRESULT WINAPI s_GetSurfaceDesc(IDirectDrawSurface* p, DDSURFACEDESC* d) { describe(S(p), d); return DD_OK; }
 static HRESULT WINAPI s_Initialize(IDirectDrawSurface* p, IDirectDraw* dd, DDSURFACEDESC* d) { (void)p; (void)dd; (void)d; return DDERR_ALREADYINITIALIZED; }
 static HRESULT WINAPI s_IsLost(IDirectDrawSurface* p) { (void)p; return DD_OK; }
+/* Render scale: who is locking? The 3D renderer: every 3D frame clears its
+ * (k-sized) view with a colour fill and then Locks (s->view_cleared; on foot
+ * from the frame function, in flight through the cockpit's frame setup,
+ * `call [eax]` at 0x0046449B, whose return address is also checked). Any
+ * other Lock of a k-sized surface is 2D drawn straight into it (the
+ * catalog's highlight box, its paperclip and stain), in 640x480. */
+static int lock_is_3d(void) {
+    for (int i = 0; i < 48; i++) {
+        uint32_t v = MEM32(g_esp + 4 * i);
+        if (v == 0x0046449D || v == 0x00464401) return 1;
+    }
+    return 0;
+}
+
+/* For the trace: the game code addresses on the guest stack at a Lock, the
+ * innermost first (return addresses, and whatever else points into .text). */
+static void trace_callers(void) {
+    char buf[256];
+    int n = 0, len = 0;
+    for (int i = 0; i < 64 && n < 10; i++) {
+        uint32_t v = MEM32(g_esp + 4 * i);
+        if (v >= 0x00401000 && v < 0x004F7600) {
+            len += snprintf(buf + len, sizeof buf - len, " %08X", v);
+            n++;
+        }
+    }
+    fprintf(stderr, "[ddraw]   callers:%s\n", n ? buf : " none");
+}
+
 static HRESULT WINAPI s_Lock(IDirectDrawSurface* p, RECT* r, DDSURFACEDESC* d, DWORD f, HANDLE e) {
     Surface* s = S(p);
     (void)f; (void)e;
+    if (TRACING) trace_callers();
+    if (s->k > 1 && s->bpp == 8 && !s->stage && !s->view_cleared && !lock_is_3d()) {
+        /* A 640x480 copy (the top-left pixel of each k x k block); Unlock
+         * writes back what changed, k x k, so the 3D under it stays sharp.
+         * Its rows are the real pitch apart, not 640: the game's surface
+         * wrapper keeps the pitch of the last Lock, and the on-foot 3D
+         * path reuses it, which drew the view squeezed into the top half.
+         * Full size, though only gw x gh is used: a 3D lock this missed
+         * would draw k times larger, and must not run off the end. */
+        int gw = s->w / s->k, gh = s->h / s->k;
+        size_t pitch = (size_t)s->pitch;
+        s->stage = (uint8_t*)calloc(pitch * s->h, 1);
+        s->stage0 = (uint8_t*)malloc(pitch * gh);
+        for (int y = 0; y < gh; y++)
+            for (int x = 0; x < gw; x++)
+                s->stage[(size_t)y * pitch + x] = s->bits[(size_t)y * s->k * pitch + (size_t)x * s->k];
+        memcpy(s->stage0, s->stage, pitch * gh);
+        TRACE("Lock %dx%d%s %p: 2D, a %dx%d view\n", s->w, s->h, s == g_primary ? " primary" : "", (void*)s, gw, gh);
+        describe(s, d);
+        d->dwWidth = gw;
+        d->dwHeight = gh;
+        d->dwFlags |= DDSD_LPSURFACE;
+        d->lpSurface = s->stage + (r ? (size_t)r->top * pitch + r->left : 0);
+        return DD_OK;
+    }
     TRACE("Lock %dx%d%s %p\n", s->w, s->h, s == g_primary ? " primary" : "", (void*)s);
     describe(s, d);
     d->dwFlags |= DDSD_LPSURFACE;
@@ -542,8 +609,22 @@ static HRESULT WINAPI s_SetPalette(IDirectDrawSurface* p, IDirectDrawPalette* pa
     return DD_OK;
 }
 static HRESULT WINAPI s_Unlock(IDirectDrawSurface* p, void* r) {
+    Surface* s = S(p);
     (void)r;
-    if (S(p) == g_primary) present("unlock");
+    if (s->stage) {                      /* a 2D Lock at render scale: enlarge what changed */
+        int k = s->k, gw = s->w / k, gh = s->h / k;
+        size_t pitch = (size_t)s->pitch;
+        for (int y = 0; y < gh; y++)
+            for (int x = 0; x < gw; x++) {
+                uint8_t c = s->stage[(size_t)y * pitch + x];
+                if (c == s->stage0[(size_t)y * pitch + x]) continue;
+                for (int j = 0; j < k; j++)
+                    memset(s->bits + (size_t)(y * k + j) * s->pitch + (size_t)x * k, c, (size_t)k);
+            }
+        free(s->stage); free(s->stage0);
+        s->stage = s->stage0 = NULL;
+    }
+    if (s == g_primary) present("unlock");
     return DD_OK;
 }
 static HRESULT WINAPI s_UpdateOverlay(IDirectDrawSurface* p, RECT* a, IDirectDrawSurface* d, RECT* b, DWORD f, DDOVERLAYFX* fx) { (void)p; (void)a; (void)d; (void)b; (void)f; (void)fx; UNIMPL("UpdateOverlay"); }
