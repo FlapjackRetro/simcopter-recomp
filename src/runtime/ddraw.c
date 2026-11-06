@@ -32,13 +32,23 @@
 #define ARG(n) MEM32(g_esp + 4 + 4 * (n))
 #define RET(v, nargs) do { g_eax = (uint32_t)(v); g_esp += 4 + 4 * (nargs); } while (0)
 
-#define VW 640
-#define VH 480
+/* The screen the game draws to: 640x480 as shipped, or --res (windowed). */
+int ddh_vw = 640, ddh_vh = 480;
+/* Render scale (--res 640k x 480k): the screen and the game's frame buffer
+ * are k times 640x480 in pixels, but the game still addresses them in
+ * 640x480 (ddh_gw x ddh_gh): every 2D Blt/BltFast/fill onto them is scaled
+ * by k and stretched, GDI on them is scaled by a world transform, and only
+ * the 3D renderer, which Locks the frame buffer and was told its view is k
+ * times larger (run_lift.py VIEW_SCALE), fills the pixels at full size.
+ * docs/bringup.md 11. */
+int ddh_gw = 640, ddh_gh = 480, ddh_k = 1;
+#define VW ddh_vw
+#define VH ddh_vh
 
 static ddh_opts_t g_o;
 static HWND     g_wnd;
 static WNDPROC  g_prev;
-static int      g_mode_w = VW, g_mode_h = VH, g_mode_bpp = 8;
+static int      g_mode_w = 640, g_mode_h = 480, g_mode_bpp = 8;
 static long     g_frames, g_written;
 static FILE*    g_ffmpeg;
 static DWORD    g_rec_t0;
@@ -47,7 +57,10 @@ static HDC      g_screen_dc;             /* GetDC of the game's window: the scre
 #define SHADOW_BYTES ((size_t)VW * VH * 4)
 static CRITICAL_SECTION g_lock;          /* the shadow: game thread vs the window's WM_PAINT */
 
-#define TRACE(...) do { if (g_o.trace) fprintf(stderr, "[ddraw] " __VA_ARGS__); } while (0)
+/* --ddraw-trace: every call. Ctrl+F12: the calls of the next 3 frames. */
+static long g_trace_until;
+#define TRACING (g_o.trace || g_frames < g_trace_until)
+#define TRACE(...) do { if (TRACING) fprintf(stderr, "[ddraw] " __VA_ARGS__); } while (0)
 #define UNIMPL(name) do { fprintf(stderr, "[ddraw] %s: not implemented\n", name); return DDERR_UNSUPPORTED; } while (0)
 
 /* ------------------------------------------------------------ objects */
@@ -70,6 +83,7 @@ typedef struct Surface {
     Palette* pal;
     DDCOLORKEY ck_src;
     int has_ck_src;
+    int k;                               /* addressed in 1/k units (render scale); 0/1: 1:1 */
 } Surface;
 
 typedef struct DDraw {
@@ -78,7 +92,9 @@ typedef struct DDraw {
 } DDraw;
 
 static Surface* g_primary;
+static Surface* g_frame;                /* render scale: the game's 640x480 frame buffer, k-sized */
 static PALETTEENTRY g_sys_pal[256];     /* the 8-bit screen's hardware palette, as GDI last realized it */
+static HPALETTE g_realized;              /* the palette it came from (AnimatePalette changes it) */
 
 /* ------------------------------------------------------------ presenting */
 
@@ -90,7 +106,9 @@ static void shadow_from_primary(void) {
     if (s->bpp == 8) {
         uint32_t lut[256];
         for (int i = 0; i < 256; i++) {
-            PALETTEENTRY p = s->pal ? s->pal->e[i] : (PALETTEENTRY){ (BYTE)i, (BYTE)i, (BYTE)i, 0 };
+            /* No DirectDraw palette on the primary: windowed, the screen
+             * shows the palette GDI realized (--res). */
+            PALETTEENTRY p = s->pal ? s->pal->e[i] : g_sys_pal[i];
             lut[i] = (uint32_t)p.peRed << 16 | (uint32_t)p.peGreen << 8 | p.peBlue;
         }
         for (int y = 0; y < h; y++) {
@@ -175,7 +193,7 @@ static void diff_tick(void) {
     } else if (snap && t >= (DWORD)g_o.diff_b) {
         size_t changed = 0;
         EnterCriticalSection(&g_lock);
-        for (size_t i = 0; i < VW * VH; i++) changed += snap[i] != g_shadow[i];
+        for (size_t i = 0; i < (size_t)VW * VH; i++) changed += snap[i] != g_shadow[i];
         LeaveCriticalSection(&g_lock);
         fprintf(stderr, "[diff] %u%% of the screen changed from %ld ms to %ld ms\n",
                 (unsigned)(changed * 100 / (VW * VH)), g_o.diff_a, g_o.diff_b);
@@ -332,15 +350,24 @@ static void fill_rect(Surface* d, RECT r, uint32_t c) {
     }
 }
 
+static void scale_rect(RECT* r, int k) {
+    if (k > 1) { r->left *= k; r->top *= k; r->right *= k; r->bottom *= k; }
+}
+
 static HRESULT WINAPI s_Blt(IDirectDrawSurface* p, RECT* dr, IDirectDrawSurface* src, RECT* sr, DWORD f, DDBLTFX* fx) {
     Surface* d = S(p), *s = S(src);
     RECT drc = dr ? *dr : (RECT){ 0, 0, d->w, d->h };
+    if (dr) scale_rect(&drc, d->k);
     if (dr && d == g_primary) to_primary((int*)&drc.left, (int*)&drc.top, (int*)&drc.right, (int*)&drc.bottom);
-    TRACE("Blt %dx%d <- %p flags %08lX\n", d->w, d->h, (void*)s, f);
+    TRACE("Blt %dx%d%s (%ld,%ld)-(%ld,%ld) <- %dx%d (%ld,%ld)-(%ld,%ld) flags %08lX\n", d->w, d->h,
+          d == g_primary ? " primary" : d == (g_primary ? g_primary->back : NULL) ? " back" : "",
+          drc.left, drc.top, drc.right, drc.bottom, s ? s->w : 0, s ? s->h : 0,
+          sr ? sr->left : 0, sr ? sr->top : 0, sr ? sr->right : (s ? s->w : 0), sr ? sr->bottom : (s ? s->h : 0), f);
     if (f & DDBLT_COLORFILL) {
         fill_rect(d, drc, fx ? fx->dwFillColor : 0);
     } else if (s) {
         RECT src_rc = sr ? *sr : (RECT){ 0, 0, s->w, s->h };
+        if (sr) scale_rect(&src_rc, s->k);
         int dw = drc.right - drc.left, dh = drc.bottom - drc.top;
         int sw = src_rc.right - src_rc.left, sh = src_rc.bottom - src_rc.top;
         int keyed = (f & DDBLT_KEYSRC) && s->has_ck_src;
@@ -370,10 +397,17 @@ static HRESULT WINAPI s_Blt(IDirectDrawSurface* p, RECT* dr, IDirectDrawSurface*
 static HRESULT WINAPI s_BltBatch(IDirectDrawSurface* p, DDBLTBATCH* b, DWORD n, DWORD f) { (void)p; (void)b; (void)n; (void)f; UNIMPL("BltBatch"); }
 static HRESULT WINAPI s_BltFast(IDirectDrawSurface* p, DWORD x, DWORD y, IDirectDrawSurface* src, RECT* sr, DWORD t) {
     Surface* d = S(p), *s = S(src);
+    if (d->k > 1 || s->k > 1) {          /* render scale: a stretch, in the game's coordinates */
+        RECT g = sr ? *sr : (RECT){ 0, 0, s->k > 1 ? s->w / s->k : s->w, s->k > 1 ? s->h / s->k : s->h };
+        RECT to = { (LONG)x, (LONG)y, (LONG)x + g.right - g.left, (LONG)y + g.bottom - g.top };
+        return s_Blt(p, &to, src, &g, (t & DDBLTFAST_SRCCOLORKEY) ? DDBLT_KEYSRC : 0, NULL);
+    }
     RECT r = sr ? *sr : (RECT){ 0, 0, s->w, s->h };
     int dx = (int)x, dy = (int)y;
     if (d == g_primary) to_primary(&dx, &dy, NULL, NULL);
-    TRACE("BltFast %dx%d <- %dx%d at %d,%d trans %lX\n", d->w, d->h, s->w, s->h, dx, dy, t);
+    TRACE("BltFast %dx%d%s at %d,%d <- %dx%d (%ld,%ld)-(%ld,%ld) trans %lX\n", d->w, d->h,
+          d == g_primary ? " primary" : d == (g_primary ? g_primary->back : NULL) ? " back" : "", dx, dy, s->w, s->h,
+          sr ? sr->left : 0, sr ? sr->top : 0, sr ? sr->right : s->w, sr ? sr->bottom : s->h, t);
     if (clip(d, s, &r, &dx, &dy)) copy_rect(d, dx, dy, s, r, (t & DDBLTFAST_SRCCOLORKEY) && s->has_ck_src);
     if (d == g_primary) present("bltfast");
     return DD_OK;
@@ -413,8 +447,14 @@ static HRESULT WINAPI s_GetColorKey(IDirectDrawSurface* p, DWORD f, DDCOLORKEY* 
 static HRESULT WINAPI s_GetDC(IDirectDrawSurface* p, HDC* o) {
     Surface* s = S(p);
     if (s->dc) return DDERR_DCALREADYCREATED;
+    TRACE("GetDC %dx%d%s %p\n", s->w, s->h, s == g_primary ? " primary" : "", (void*)s);
     s->dc = CreateCompatibleDC(NULL);
     SelectObject(s->dc, s->dib);
+    if (s->k > 1) {                      /* the game draws in 640x480 */
+        XFORM x = { (FLOAT)s->k, 0, 0, (FLOAT)s->k, 0, 0 };
+        SetGraphicsMode(s->dc, GM_ADVANCED);
+        SetWorldTransform(s->dc, &x);
+    }
     Palette* pal = s->pal ? s->pal : g_primary ? g_primary->pal : NULL;
     if (s->bpp == 8 && pal) {              /* GDI maps colours through the DIB's table */
         RGBQUAD q[256];
@@ -463,6 +503,7 @@ static HRESULT WINAPI s_IsLost(IDirectDrawSurface* p) { (void)p; return DD_OK; }
 static HRESULT WINAPI s_Lock(IDirectDrawSurface* p, RECT* r, DDSURFACEDESC* d, DWORD f, HANDLE e) {
     Surface* s = S(p);
     (void)f; (void)e;
+    TRACE("Lock %dx%d%s %p\n", s->w, s->h, s == g_primary ? " primary" : "", (void*)s);
     describe(s, d);
     d->dwFlags |= DDSD_LPSURFACE;
     d->lpSurface = s->bits + (r ? (size_t)r->top * s->pitch + (size_t)r->left * (s->bpp / 8) : 0);
@@ -583,10 +624,19 @@ static HRESULT WINAPI dd_CreateSurface(IDirectDraw* p, DDSURFACEDESC* d, IDirect
     Surface* s;
     (void)p; (void)u;
     if (caps & DDSCAPS_PRIMARYSURFACE) {
-        s = surf_new(g_mode_w, g_mode_h, g_mode_bpp, caps | DDSCAPS_VISIBLE | DDSCAPS_FRONTBUFFER);
-        if (d->dwFlags & DDSD_BACKBUFFERCOUNT && d->dwBackBufferCount)
-            s->back = surf_new(g_mode_w, g_mode_h, g_mode_bpp, DDSCAPS_BACKBUFFER | DDSCAPS_FLIP | DDSCAPS_VIDEOMEMORY);
+        int k = ddh_k;
+        s = surf_new(g_mode_w * k, g_mode_h * k, g_mode_bpp, caps | DDSCAPS_VISIBLE | DDSCAPS_FRONTBUFFER);
+        if (s) s->k = k;
+        if (s && d->dwFlags & DDSD_BACKBUFFERCOUNT && d->dwBackBufferCount) {
+            s->back = surf_new(g_mode_w * k, g_mode_h * k, g_mode_bpp, DDSCAPS_BACKBUFFER | DDSCAPS_FLIP | DDSCAPS_VIDEOMEMORY);
+            if (s->back) s->back->k = k;
+        }
         g_primary = s;
+    } else if (ddh_k > 1 && g_primary && !g_frame && (int)d->dwWidth == g_mode_w && (int)d->dwHeight == g_mode_h) {
+        /* The game's frame buffer, made right after the primary: the 3D
+         * renders into it at k times, the cockpit is scaled onto it. */
+        s = surf_new(g_mode_w * ddh_k, g_mode_h * ddh_k, bpp, caps ? caps : DDSCAPS_OFFSCREENPLAIN);
+        if (s) { s->k = ddh_k; g_frame = s; }
     } else {
         s = surf_new((int)d->dwWidth, (int)d->dwHeight, bpp, caps ? caps : DDSCAPS_OFFSCREENPLAIN);
     }
@@ -599,10 +649,10 @@ static HRESULT WINAPI dd_CreateSurface(IDirectDraw* p, DDSURFACEDESC* d, IDirect
 }
 static HRESULT WINAPI dd_DuplicateSurface(IDirectDraw* p, IDirectDrawSurface* s, IDirectDrawSurface** o) { (void)p; (void)s; (void)o; UNIMPL("DuplicateSurface"); }
 static HRESULT WINAPI dd_EnumDisplayModes(IDirectDraw* p, DWORD f, DDSURFACEDESC* d, void* c, LPDDENUMMODESCALLBACK cb) {
-    static const int modes[][3] = { { 640, 480, 8 }, { 640, 480, 16 } };
+    int modes[][3] = { { 640, 480, 8 }, { 640, 480, 16 }, { VW, VH, 8 } };
     (void)p; (void)f; (void)d;
     TRACE("EnumDisplayModes\n");
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < (VW == 640 && VH == 480 ? 2 : 3); i++) {
         DDSURFACEDESC m;
         memset(&m, 0, sizeof m);
         m.dwSize = sizeof m;
@@ -664,7 +714,8 @@ static HRESULT WINAPI dd_SetCooperativeLevel(IDirectDraw* p, HWND w, DWORD f) {
 static HRESULT WINAPI dd_SetDisplayMode(IDirectDraw* p, DWORD w, DWORD h, DWORD bpp) {
     (void)p;
     fprintf(stderr, "[ddraw] SetDisplayMode(%lux%lux%lu)\n", w, h, bpp);
-    if (w != VW || h != VH || (bpp != 8 && bpp != 16)) return DDERR_INVALIDMODE;
+    if (!((w == 640 && h == 480) || (w == (DWORD)VW && h == (DWORD)VH)) || (bpp != 8 && bpp != 16))
+        return DDERR_INVALIDMODE;
     g_mode_w = (int)w; g_mode_h = (int)h; g_mode_bpp = (int)bpp;
     return DD_OK;
 }
@@ -791,11 +842,29 @@ static UINT WINAPI realize(HDC dc) {
     HPALETTE p = (HPALETTE)GetCurrentObject(dc, OBJ_PAL);
     if (p && p != GetStockObject(DEFAULT_PALETTE)) {
         UINT n = GetPaletteEntries(p, 0, 256, g_sys_pal);
+        g_realized = p;
         TRACE("RealizePalette: %u entries, [1] = %02X%02X%02X\n", n, g_sys_pal[1].peRed, g_sys_pal[1].peGreen, g_sys_pal[1].peBlue);
     }
     return RealizePalette(dc);
 }
-void ddh_shim_RealizePalette(void) { RET(realize((HDC)(uintptr_t)ARG(0)), 1); }
+void ddh_shim_RealizePalette(void) {
+    RET(realize((HDC)(uintptr_t)ARG(0)), 1);
+    if (g_primary && !g_primary->pal) present("realize");
+}
+
+/* Windowed (--res), the game animates its realized GDI palette in place
+ * (sub_0045C5A0: AnimatePalette, PC_RESERVED entries): on an 8-bit screen
+ * that changed the hardware palette at once, so the screen follows it. */
+void ddh_shim_AnimatePalette(void) {
+    HPALETTE h = (HPALETTE)(uintptr_t)ARG(0);
+    UINT start = ARG(1), n = ARG(2);
+    BOOL r = AnimatePalette(h, start, n, (const PALETTEENTRY*)(uintptr_t)ARG(3));
+    if (h && h == g_realized && start < 256) {
+        GetPaletteEntries(h, start, n > 256 - start ? 256 - start : n, g_sys_pal + start);
+        if (g_primary && !g_primary->pal) present("animate");
+    }
+    RET(r, 4);
+}
 
 /* The menus take their DirectDraw palette from the system palette
  * (sub_0053A0D0). A 32-bit desktop has none and answers 0 entries, which
@@ -841,6 +910,11 @@ static int WINAPI smack_StretchDIBits(HDC dc, int x, int y, int w, int h, int sx
  * palette entry and the system palette the host answers GetSystemPaletteEntries
  * with. Written next to the game (its current folder) as palette-N.txt, with
  * the picture as palette-N.bmp. */
+void ddh_trace_frames(int n) {
+    g_trace_until = g_frames + n;
+    fprintf(stderr, "[ddraw] --- tracing %d frames from frame %ld ---\n", n, g_frames);
+}
+
 void ddh_dump_palette(void) {
     static int n;
     char path[64];
@@ -929,11 +1003,23 @@ static LRESULT CALLBACK cloak_hook(int code, WPARAM w, LPARAM l) {
 
 void ddh_init(const ddh_opts_t* o) {
     g_o = *o;
+    if (o->k > 1) {                      /* render scale: 640x480 to the game, k times on screen */
+        ddh_k = o->k;
+        ddh_vw = 640 * o->k; ddh_vh = 480 * o->k;
+    } else if (o->res_w >= 640 && o->res_h >= 480) {
+        ddh_vw = ddh_gw = o->res_w; ddh_vh = ddh_gh = o->res_h;
+        g_mode_w = VW; g_mode_h = VH;      /* the desktop the windowed game sits on */
+    }
     InitializeCriticalSection(&g_lock);
     BITMAPINFO bi = { { sizeof(BITMAPINFOHEADER), VW, -VH, 1, 32, BI_RGB } };
     HBITMAP dib = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, (void**)&g_shadow, NULL, 0);
     g_screen_dc = CreateCompatibleDC(NULL);
     SelectObject(g_screen_dc, dib);
+    if (ddh_k > 1) {                     /* Smacker draws its videos in 640x480 */
+        XFORM x = { (FLOAT)ddh_k, 0, 0, (FLOAT)ddh_k, 0, 0 };
+        SetGraphicsMode(g_screen_dc, GM_ADVANCED);
+        SetWorldTransform(g_screen_dc, &x);
+    }
     if (o->headless) SetWindowsHookExA(WH_CBT, cloak_hook, NULL, GetCurrentThreadId());
     if (!o->headless) {
         /* sco.ini lives beside the exe: settings belong to

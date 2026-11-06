@@ -73,8 +73,38 @@ UNWIND_CHECK = ('{ extern uint32_t sco_unwind; if (sco_unwind) { sco_unwind = 0;
 # The lift stays faithful; a patch is a line of C after an instruction this
 # file names, for what the lift cannot do by itself (a divide the game expects
 # to fault, as Streets' 0x004C7993). --original runs the shipping code
-# unpatched, so it remains the reference. None are known for SimCopter yet.
-PATCHES = {}
+# unpatched, so it remains the reference.
+#
+# The screen mode. The game sizes its display, 3D view and borders from one
+# global, 0x005017D0 (sub_004641C0: 0 = 320x240, 1 = 640x480, 2 = 800x600,
+# 3 = 1024x768), and its start-up sets it to 1 outright (0x0045DE77). Just
+# before, the same function fills the app object (esi, also [0x00501A44])
+# with two screen descriptions, width, height, depth, at +0x4040 and +0x404C,
+# both 640, 480, 8, and the renderer sizes itself from those: mode 3 alone
+# drew a 640x480 view in a 1024x768 screen. The host's --res sets all three
+# (sco_screen_mode, sco_screen_w/h; mode -1 leaves the game's own).
+SCREEN_MODE = ('{ extern int32_t sco_screen_mode, sco_screen_w, sco_screen_h; if (sco_screen_mode >= 0) { '
+               'MEM32(0x005017D0) = (uint32_t)sco_screen_mode; '
+               'MEM32(esi + 0x4040) = MEM32(esi + 0x404C) = (uint32_t)sco_screen_w; '
+               'MEM32(esi + 0x4044) = MEM32(esi + 0x4050) = (uint32_t)sco_screen_h; } } /* run_lift.py: --res */')
+# Render scale. sub_00413170 sizes the 3D view: it takes the screen size from
+# sub_004641C0 (640x480 in mode 1) into [ebx], [edi], and then the view is
+# either that whole screen (no cockpit: on foot, [esi+0x30] == 0) or, in
+# mode 1, the screen less an 80-pixel cockpit border (ecx = width - 0x50,
+# edx = height - 0x50). With --res 640k x 480k the frame buffer is k times
+# larger in pixels (the host's DirectDraw), so the screen size is scaled as it
+# comes back, and the border with it: the view is 640k x 480k or 560k x 400k,
+# rendered at full size, while the cockpit and the rest of the 2D stay in
+# 640x480 and the host scales them. docs/bringup.md 11.
+VIEW_SCREEN = ('{ extern int32_t sco_scale; if (sco_scale > 1) { MEM32(ebx) *= (uint32_t)sco_scale; '
+               'MEM32(edi) *= (uint32_t)sco_scale; } } /* run_lift.py: --res 640k x 480k */')
+VIEW_BORDER = ('{ extern int32_t sco_scale; if (sco_scale > 1) { ecx -= 0x50u * (uint32_t)(sco_scale - 1); '
+               'edx -= 0x50u * (uint32_t)(sco_scale - 1); } } /* run_lift.py: --res 640k x 480k */')
+PATCHES = {
+    0x0045DE77: SCREEN_MODE,          # mov dword ptr [0x5017d0], 1
+    0x00413180: VIEW_SCREEN,          # call sub_004641C0: the screen size, into [ebx], [edi]
+    0x004131AF: VIEW_BORDER,          # sub edx, 0x50 (mode 1: the view is the screen less the cockpit)
+}
 
 
 def apply_patches(body, patches):

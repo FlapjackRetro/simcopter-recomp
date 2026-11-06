@@ -144,7 +144,84 @@ The black lawn: in flight 10-15 and 224-233 of the game's palette are black
 (`flags 05`), and only the static colours come from the system palette, so it
 is not the stale-palette idea. F12 (`palette-N.txt`) is the tool for it.
 
-## 10. Open questions
+## 10. Higher resolution: `--res WxH`
+
+The game's own windowed mode (`-w`, Readme.txt) renders the 3D view at the
+size of its window (before the window shims it made a 1334x1000 back surface
+from the real one). `--res 1600x1200` uses that: the game gets `-w`, its
+window and desktop answer as that size (`GetClientRect`, `GetWindowRect`,
+`GetSystemMetrics`), its desktop as 8-bit (`GetDeviceCaps` BITSPIXEL/PLANES,
+checked in `sub_00402CF0`: windowed wants 256 colours), and the host's
+screen, shadow and presenter are that size (`ddh_vw`/`ddh_vh` replace the
+640x480 constants). The presenter scales it to the real window as before,
+aspect locked.
+
+Windowed, the game may colour the screen through a realized GDI palette
+rather than one on the DirectDraw primary, and animate it with
+`AnimatePalette` (`sub_0045C5A0`): with no palette on the primary the screen
+now shows the realized one, and follows `AnimatePalette`.
+
+Expected rough edges: videos centred at their own size (Smacker draws 1:1),
+and menus laid out for 640x480.
+
+### The game's own screen modes
+
+Windowed (`-w`) turned out to be fixed at 640x480: the game pins its window
+size (`WM_GETMINMAXINFO` in `sub_00421450`), and the flight view stayed
+640x480 in a 1280x960 screen however the window was moved.
+
+The real lever is a global, `0x005017D0`, the screen mode.
+`sub_004641C0` maps it to the screen size: 0 = 320x240, 1 = 640x480,
+2 = 800x600, 3 = 1024x768. `sub_00413170` sizes the 3D view from it (screen
+minus a border per mode: 40, 80, 100, 128), and the window setup at
+`0x00430F9E` has a rectangle for each. Only one write sets it: `= 1` at
+`0x0045DE77`, during start-up. The cockpit layouts (`sub_004124C0`,
+`sub_00412860`) have a branch for mode 1 only, so 2 and 3 look like an
+unfinished feature switched off.
+
+`--res 800x600` / `--res 1024x768` now set it (run_lift.py `SCREEN_MODE`, a
+line after `0x0045DE77`; `sco_screen_mode` in host.c) and the game runs
+fullscreen at that size: the display mode, the host's screen and the window
+answers follow. Beyond 1024x768 would mean extending the table.
+
+First try at 1024x768: the screen was 1024x768 but the 3D view 640x480 in
+its corner, and no cockpit. The same start-up function writes two screen
+descriptions into the app object (`+0x4040` and `+0x404C`: 640, 480, 8),
+which the renderer sizes from; the patch now sets those to the `--res` size
+too. The cockpit layouts only know mode 1, so they are next.
+
+## 11. Render scale: `--res 1280x960` / `1920x1440`
+
+The game's larger modes have no cockpit layout: `sub_004124C0` fills its
+table of eight panel rectangles only in mode 1, and the panels are fixed-size
+bitmaps inside a widget tree (`sub_00404300`), with gauges and buttons at
+offsets inside them. So the 2D stays as designed, at 640x480, and only the 3D
+is rendered larger.
+
+A Ctrl+F12 trace (3 frames of DirectDraw calls) shows the frame: a colour
+fill of (0,0)-(560,400) on a 640x480 offscreen frame buffer, a `Lock` of it
+(the 3D renderer writes there), ten cockpit `Blt`s at 1:1 in 640x480
+coordinates, and the frame buffer `Blt` to the primary.
+
+With `--res 640k x 480k` (k = 2, 3, 4) the game stays in mode 1 and:
+
+- the primary and the frame buffer (the first 640x480 offscreen surface after
+  the primary) are 640k x 480k pixels, addressed by the game in 640x480: every
+  `Blt`/`BltFast`/fill onto or from them is scaled by k and stretched
+  (nearest neighbour, colour key kept);
+- `GetDC` on them, and the window DC Smacker draws into, carry a world
+  transform of k, so GDI text and the videos scale too;
+- the 3D view is k times larger: `sub_00413170` takes the screen size from
+  `sub_004641C0` and makes the view either all of it (no cockpit, on foot,
+  `[esi+0x30] == 0`) or, in mode 1, the screen less an 80-pixel border; the
+  screen size is scaled as it returns (run_lift.py `VIEW_SCREEN`, after
+  `0x00413180`) and the border with it (`VIEW_BORDER`, after `0x004131AF`).
+  The renderer, given the full-size frame buffer by `Lock`, draws it at full
+  resolution. (A first version scaled only the bordered view: in flight was
+  right, on foot stayed 640x480 in the corner.)
+- the window, the mouse and `WM_SIZE` stay in 640x480 (`ddh_gw`/`ddh_gh`).
+
+## 12. Open questions
 
 - Whether the Glide probe is `grGlideInit` + `grSstQueryHardware` as the
   imports suggest, and what the game does when it answers "none".

@@ -25,9 +25,12 @@
 
 #include "present.h"
 void ddh_dump_palette(void);   /* ddraw.c: F12 */
+void ddh_trace_frames(int n);  /* ddraw.c: Ctrl+F12 */
 
-#define VW 640
-#define VH 480
+extern int ddh_vw, ddh_vh;             /* ddraw.c: the screen in pixels: 640x480, or --res */
+extern int ddh_gw, ddh_gh;             /* ...and as the game addresses it (mouse, sizes) */
+#define VW ddh_vw
+#define VH ddh_vh
 
 typedef HRESULT (WINAPI *compile_fn)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR,
                                      UINT, UINT, ID3DBlob**, ID3DBlob**);
@@ -132,7 +135,7 @@ static HWND   g_wnd;
 static HMENU  g_menu;
 static HANDLE g_ready;                   /* auto-reset: a picture (or a resize) to show */
 static CRITICAL_SECTION g_lock;          /* g_pic, against the game thread */
-static uint32_t g_pic[VW * VH], g_copy[VW * VH];
+static uint32_t *g_pic, *g_copy;        /* VW x VH, from present_init */
 static int    g_have;
 static LONG   g_saved_style;
 static RECT   g_saved_rect;
@@ -190,6 +193,8 @@ static void load(void) {
 
 void present_init(const char* ini, int scale) {
     strncpy(g_ini, ini, sizeof g_ini - 1);
+    g_pic = (uint32_t*)calloc((size_t)VW * VH, 4);
+    g_copy = (uint32_t*)calloc((size_t)VW * VH, 4);
     load();
     if (scale > 0) g_scale = scale;               /* --scale: this run only */
 }
@@ -292,7 +297,7 @@ static void draw(void) {
     if (cw <= 0 || ch <= 0) return;
     EnterCriticalSection(&g_lock);
     int have = g_have;
-    if (have) memcpy(g_copy, g_pic, sizeof g_copy);
+    if (have) memcpy(g_copy, g_pic, (size_t)VW * VH * 4);
     LeaveCriticalSection(&g_lock);
     if (!have) return;
     RECT r = fit(cw, ch);
@@ -350,7 +355,7 @@ static DWORD WINAPI thread(LPVOID unused) {
 void present_frame(const uint32_t* bgra) {
     if (!g_ready) return;
     EnterCriticalSection(&g_lock);
-    memcpy(g_pic, bgra, sizeof g_pic);
+    memcpy(g_pic, bgra, (size_t)VW * VH * 4);
     g_have = 1;
     LeaveCriticalSection(&g_lock);
     SetEvent(g_ready);
@@ -491,8 +496,8 @@ void present_unmap(int* x, int* y) {
     RECT cr, f;
     if (!g_ready || !GetClientRect(g_wnd, &cr)) return;
     f = fit(cr.right, cr.bottom);
-    *x = f.left + (*x * (f.right - f.left) + (f.right - f.left) / 2) / VW;
-    *y = f.top + (*y * (f.bottom - f.top) + (f.bottom - f.top) / 2) / VH;
+    *x = f.left + (*x * (f.right - f.left) + (f.right - f.left) / 2) / ddh_gw;
+    *y = f.top + (*y * (f.bottom - f.top) + (f.bottom - f.top) / 2) / ddh_gh;
 }
 
 int present_message(HWND h, UINT m, WPARAM w, LPARAM* l, LRESULT* r) {
@@ -503,14 +508,15 @@ int present_message(HWND h, UINT m, WPARAM w, LPARAM* l, LRESULT* r) {
         RECT cr, f;
         GetClientRect(g_wnd, &cr);
         f = fit(cr.right, cr.bottom);
-        int x = ((short)LOWORD(*l) - f.left) * VW / max(f.right - f.left, 1);
-        int y = ((short)HIWORD(*l) - f.top) * VH / max(f.bottom - f.top, 1);
-        *l = MAKELPARAM(max(0, min(VW - 1, x)), max(0, min(VH - 1, y)));
+        int x = ((short)LOWORD(*l) - f.left) * ddh_gw / max(f.right - f.left, 1);
+        int y = ((short)HIWORD(*l) - f.top) * ddh_gh / max(f.bottom - f.top, 1);
+        *l = MAKELPARAM(max(0, min(ddh_gw - 1, x)), max(0, min(ddh_gh - 1, y)));
         return 0;                                   /* on to the game, mapped */
     }
     switch (m) {
     case WM_KEYDOWN:
         if (w == VK_F11) { set_fullscreen(!g_full); return 1; }
+        if (w == VK_F12 && (GetKeyState(VK_CONTROL) & 0x8000)) { ddh_trace_frames(3); return 1; }
         if (w == VK_F12) { ddh_dump_palette(); return 1; }     /* docs/bringup.md 9 */
         if (w == VK_ESCAPE && g_full) { set_fullscreen(0); return 1; }
         return 0;
@@ -524,6 +530,11 @@ int present_message(HWND h, UINT m, WPARAM w, LPARAM* l, LRESULT* r) {
         return HIWORD(w) == 0 && command(LOWORD(w));
     case WM_SIZE:
         SetEvent(g_ready);
+        /* The game hears its own size, not the real window's: 640x480, or
+         * --res. Windowed (-w), SimCopter sizes its 3D view from WM_SIZE,
+         * and a real client area larger than the desktop it was told about
+         * left the view at 640x480 (docs/bringup.md 10). */
+        if (w != SIZE_MINIMIZED) *l = MAKELPARAM(ddh_gw, ddh_gh);
         return 0;
     case WM_PAINT:
         ValidateRect(g_wnd, NULL);
@@ -531,6 +542,12 @@ int present_message(HWND h, UINT m, WPARAM w, LPARAM* l, LRESULT* r) {
         return 1;
     case WM_ERASEBKGND:
         *r = 1;
+        return 1;
+    case WM_GETMINMAXINFO:
+        /* The real window is the presenter's. Windowed (-w), the game pins
+         * its window to one size here (sub_00421450: min = max = its own
+         * window rect), which fought the presenter's size and left part of
+         * the client area unpainted. Windows' defaults stand. */
         return 1;
     }
     return 0;

@@ -37,7 +37,7 @@ extern const uint32_t sco_entry_va;       /* recomp_dispatch.c */
 static DWORD g_watchdog_s;
 static int   g_headless;
 static char  g_game[MAX_PATH];           /* the game folder, with a trailing '\' */
-static char  g_guest_exe[MAX_PATH], g_guest_cmdline[MAX_PATH + 3];
+static char  g_guest_exe[MAX_PATH], g_guest_cmdline[MAX_PATH + 512];
 
 #define ARG(n) MEM32(g_esp + 4 + 4 * (n))
 #define RET(v, nargs) do { g_eax = (uint32_t)(v); g_esp += 4 + 4 * (nargs); } while (0)
@@ -283,8 +283,8 @@ static void shim_GetClientRect(void) {
     RECT* r = (RECT*)(uintptr_t)ARG(1);
     if (h && h == ddh_window() && r) {
         r->left = r->top = 0;
-        r->right = 640;
-        r->bottom = 480;
+        r->right = ddh_gw;                   /* 640x480, or --res */
+        r->bottom = ddh_gh;
         RET(TRUE, 2);
         return;
     }
@@ -327,7 +327,7 @@ static void shim_SetWindowLongA(void) {
 static void shim_GetWindowRect(void) {
     RECT* r = (RECT*)(uintptr_t)ARG(1);
     if (game_wnd(ARG(0)) && r) {
-        SetRect(r, 0, 0, 640, 480);
+        SetRect(r, 0, 0, ddh_gw, ddh_gh);
         RET(TRUE, 2);
         return;
     }
@@ -341,9 +341,39 @@ static void shim_ClientToScreen(void) {
 
 static void shim_GetSystemMetrics(void) {
     int i = (int)ARG(0);
-    if (i == SM_CXSCREEN || i == SM_CXFULLSCREEN) { RET(640, 1); return; }
-    if (i == SM_CYSCREEN || i == SM_CYFULLSCREEN) { RET(480, 1); return; }
+    if (i == SM_CXSCREEN || i == SM_CXFULLSCREEN) { RET(ddh_gw, 1); return; }
+    if (i == SM_CYSCREEN || i == SM_CYFULLSCREEN) { RET(ddh_gh, 1); return; }
     RET(GetSystemMetrics(i), 1);
+}
+
+/* --res: the game runs windowed (-w) on a desktop of exactly that size, and
+ * windowed it insists the desktop be 256 colours (sub_00402CF0 reads
+ * PLANES and BITSPIXEL of the screen; Readme.txt: "at least 800x600 ... in
+ * exactly 256 colors"). So the screen answers as that 8-bit display. At
+ * 640x480 (fullscreen, as shipped) nothing is changed. */
+static int g_res;                  /* windowed (-w): the desktop answers as 8-bit */
+
+/* --res: the game's own screen mode (run_lift.py SCREEN_MODE), -1 as shipped. */
+int32_t sco_screen_mode = -1, sco_screen_w = 640, sco_screen_h = 480;
+/* --res 640k x 480k: the 3D view at k times (run_lift.py VIEW_SCALE); 1 as shipped. */
+int32_t sco_scale = 1;
+
+static void shim_GetDeviceCaps(void) {
+    HDC dc = (HDC)(uintptr_t)ARG(0);
+    int i = (int)ARG(1);
+    if (g_res) {
+        switch (i) {
+        case BITSPIXEL:   RET(8, 2); return;
+        case PLANES:      RET(1, 2); return;
+        case HORZRES:     RET(ddh_gw, 2); return;
+        case VERTRES:     RET(ddh_gh, 2); return;
+        case SIZEPALETTE: RET(256, 2); return;
+        case NUMRESERVED: RET(20, 2); return;
+        case NUMCOLORS:   RET(20, 2); return;
+        case RASTERCAPS:  RET(GetDeviceCaps(dc, RASTERCAPS) | RC_PALETTE, 2); return;
+        }
+    }
+    RET(GetDeviceCaps(dc, i), 2);
 }
 
 /* The frame pace. The game simulates once per pass of its main loop
@@ -451,6 +481,7 @@ static native32_shim_t g_shims[] = {
     { "ClientToScreen", shim_ClientToScreen },
     { "GetSystemMetrics", shim_GetSystemMetrics },
     { "PeekMessageA", shim_PeekMessageA },
+    { "GetDeviceCaps", shim_GetDeviceCaps },
     { "_grSstQueryHardware@4", shim_grSstQueryHardware },
     { "_grGlideInit@0", shim_grGlideInit },
     { "_grGlideShutdown@0", shim_grGlideShutdown },
@@ -546,12 +577,13 @@ static DWORD WINAPI watchdog(LPVOID unused) {
 
 int main(int argc, char** argv) {
     const char* game = "game\\SIMCOPTER";
-    int run = 0, scale = 0, original = 0, nlift = 0;
+    int run = 0, scale = 0, original = 0, nlift = 0, guest_args = 0;
     static uint32_t lift[256];
     ddh_opts_t o = { 0 };
     for (int i = 1; i < argc; i++) {
         int n = recomp_trace_arg(argc, argv, i);
         if (n) { i += n - 1; continue; }
+        if (!strcmp(argv[i], "--")) { guest_args = i + 1; break; }   /* the rest is SimCopter's */
         if (!strcmp(argv[i], "--run")) run = 1;
         else if (!strcmp(argv[i], "--headless")) g_headless = 1;
         else if (!strcmp(argv[i], "--key") && i + 1 < argc) {
@@ -583,6 +615,25 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) g_fps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--res") && i + 1 < argc) {
+            /* The sizes in the game's own table (sub_004641C0). */
+            static const int modes[][2] = { { 320, 240 }, { 640, 480 }, { 800, 600 }, { 1024, 768 } };
+            if (sscanf(argv[++i], "%dx%d", &o.res_w, &o.res_h) == 2) {
+                /* 640x480 times k: render scale, the cockpit as designed */
+                for (int k = 2; k <= 4; k++)
+                    if (o.res_w == 640 * k && o.res_h == 480 * k) sco_scale = o.k = k;
+                if (sco_scale > 1) { o.res_w = o.res_h = 0; continue; }
+                for (int m = 0; m < 4; m++)
+                    if (o.res_w == modes[m][0] && o.res_h == modes[m][1]) sco_screen_mode = m;
+            }
+            if (sco_screen_mode < 0) {
+                fprintf(stderr, "bad --res %s: 1280x960, 1920x1440, 2560x1920 (render scale), or the game's own\n"
+                        "modes 800x600, 1024x768 (no cockpit layout)\n", argv[i]);
+                return 1;
+            }
+            sco_screen_w = o.res_w; sco_screen_h = o.res_h;
+            if (o.res_w < 640) o.res_w = 640, o.res_h = 480;   /* 320x240 shows in a 640x480 screen */
+        }
         else if (!strcmp(argv[i], "--game") && i + 1 < argc) game = argv[++i];
         else if (!strcmp(argv[i], "--open") && i + 1 < argc) GetFullPathNameA(argv[++i], MAX_PATH, g_open, NULL);
         else if (!strcmp(argv[i], "--watchdog") && i + 1 < argc) g_watchdog_s = strtoul(argv[++i], NULL, 0);
@@ -596,8 +647,9 @@ int main(int argc, char** argv) {
         else {
             printf("usage: sco [--run] [--headless] [--record out.mp4] [--frames N]\n"
                    "             [--shot N:file.bmp] [--diff A,B] [--key NAME@MS[+HOLD]] [--click X,Y@MS]\n"
-                   "             [--scale N] [--fps N] [--game game] [--watchdog S] [--native-trace]\n"
-                   "             [--callbacks] [--ddraw-trace] [--original [--lifted VA,...]]\n");
+                   "             [--scale N] [--fps N] [--res WxH] [--game game] [--watchdog S] [--native-trace]\n"
+                   "             [--callbacks] [--ddraw-trace] [--original [--lifted VA,...]]\n"
+                   "             [-- SimCopter switches, e.g. -g1 -m5]\n");
             recomp_trace_help();
             return argv[i][1] == 'h' || argv[i][2] == 'h' ? 0 : 1;
         }
@@ -606,6 +658,20 @@ int main(int argc, char** argv) {
     if (g_game[strlen(g_game) - 1] != '\\') strcat(g_game, "\\");
     _snprintf(g_guest_exe, sizeof g_guest_exe - 1, "%sSimCopter.exe", g_game);
     _snprintf(g_guest_cmdline, sizeof g_guest_cmdline - 1, "\"%s\"", g_guest_exe);
+    /* `sco --run -- -g1 -m5`: SimCopter's own switches (its Readme.txt: -w, -g1..4,
+     * -mN, -xCHEAT, -b), on the command line the game reads. */
+    for (int i = guest_args; guest_args && i < argc; i++) {
+        strncat(g_guest_cmdline, " ", sizeof g_guest_cmdline - strlen(g_guest_cmdline) - 1);
+        strncat(g_guest_cmdline, argv[i], sizeof g_guest_cmdline - strlen(g_guest_cmdline) - 1);
+    }
+    /* Windowed (-w, a game switch after --): its desktop must look 8-bit. */
+    g_res = strstr(g_guest_cmdline, " -w") != NULL;
+    if (sco_screen_mode >= 0)
+        printf("[res] screen mode %d: %dx%d (the game's own table)\n", sco_screen_mode, o.res_w, o.res_h);
+    if (sco_scale > 1)
+        printf("[res] render scale %d: %dx%d, the 3D at full size, the 2D scaled from 640x480\n",
+               sco_scale, 640 * sco_scale, 480 * sco_scale);
+    if (guest_args) printf("[args] %s\n", g_guest_cmdline);
 
     timeBeginPeriod(1);                  /* the guest's timeGetTime, and pace()'s Sleep */
     if (g_fps > 0) printf("[pace] main loop held to %d fps (--fps N; 0 = unpaced)\n", g_fps);

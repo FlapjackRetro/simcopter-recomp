@@ -19,6 +19,8 @@ typedef struct {
     long shot_frame;             /* --shot N:file.bmp */
     const char* shot_path;
     long diff_a, diff_b;         /* --diff A,B: ms after start */
+    int res_w, res_h;            /* --res WxH: the game's own screen mode (800x600, 1024x768) */
+    int k;                       /* --res 640k x 480k: the 3D at k times, the 2D scaled by k */
 } ddh_opts_t;
 
 void ddh_init(const ddh_opts_t* o);
@@ -42,10 +44,16 @@ void ddh_hook_module(const char* dll);   /* a native DLL that draws into the gam
     { "GetDC", ddh_shim_GetDC }, \
     { "ReleaseDC", ddh_shim_ReleaseDC }, \
     { "RealizePalette", ddh_shim_RealizePalette }, \
-    { "GetSystemPaletteEntries", ddh_shim_GetSystemPaletteEntries }
+    { "GetSystemPaletteEntries", ddh_shim_GetSystemPaletteEntries }, \
+    { "AnimatePalette", ddh_shim_AnimatePalette }
 
 /* F12: write the primary's palette, the system palette the host reports and
  * the primary's index histogram to palette-N.txt (and palette-N.bmp). */
 void ddh_dump_palette(void);
+
+/* The screen: ddh_vw x ddh_vh pixels (presented); the game addresses it as
+ * ddh_gw x ddh_gh (its 2D coordinates). Equal unless --res 640k x 480k. */
+extern int ddh_vw, ddh_vh, ddh_gw, ddh_gh, ddh_k;
+void ddh_shim_AnimatePalette(void);
 
 #endif

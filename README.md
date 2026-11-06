@@ -79,6 +79,7 @@ some-folder\
 ```
 sco [--run] [--headless] [--record out.mp4] [--frames N] [--shot N:file.bmp]
     [--diff A,B] [--key NAME@MS[+HOLD]] [--click X,Y@MS] [--scale N]
+    [--fps N] [--res WxH] [-- SimCopter switches]
     [--game game] [--open FILE] [--watchdog S] [--native-trace] [--callbacks]
     [--ddraw-trace] [--original [--lifted VA,...]]
 ```
