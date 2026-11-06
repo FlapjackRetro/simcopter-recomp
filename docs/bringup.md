@@ -108,6 +108,14 @@ without doing them, answers `GetWindowRect` with 0,0-640,480 and leaves
 `ClientToScreen` points as they are, and `GetSystemMetrics` reports a
 640x480 screen: the 1997 desktop the game expects.
 
+With that, the intro was framed and the window large, but the menu was black:
+Streets' DirectDraw took every blit to the primary relative to the real
+window's screen position (`to_primary`, from `ClientToScreen` of the real
+window). The game's own `ClientToScreen` now answers 0,0, so its coordinates
+are already client-relative and the subtraction put the menu off the
+picture. `to_primary` no longer moves them. (Before these shims, the game's
+real-window coordinates and the host's subtraction had cancelled out.)
+
 ## 8. Open questions for the first runs
 
 - Whether the Glide probe is `grGlideInit` + `grSstQueryHardware` as the

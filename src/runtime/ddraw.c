@@ -283,14 +283,15 @@ static HRESULT WINAPI s_AddAttachedSurface(IDirectDrawSurface* p, IDirectDrawSur
 static HRESULT WINAPI s_AddOverlayDirtyRect(IDirectDrawSurface* p, RECT* r) { (void)p; (void)r; UNIMPL("AddOverlayDirtyRect"); }
 
 /* The primary is the whole screen, and the game addresses it in screen
- * coordinates: its window's client area, from ClientToScreen. Its window
- * sat at 0,0 of a 640x480 desktop; this one is wherever the host put it, so
- * a destination on the primary is taken relative to the client area. */
+ * coordinates: its window's client area, from ClientToScreen. Streets of
+ * SimCity's host took a destination on the primary relative to the real
+ * window's client area here. In SimCopter's host the game's own
+ * ClientToScreen and GetWindowRect already answer as a window at 0,0 of a
+ * 640x480 desktop (host.c, "the game sizes and places that window itself"),
+ * so its screen coordinates are client coordinates: subtracting the real
+ * window's position again put every menu blit off the picture. */
 static void to_primary(int* l, int* t, int* r, int* b) {   /* LONG is int on Win32 */
-    POINT o = { 0, 0 };
-    if (!g_wnd || !ClientToScreen(g_wnd, &o)) return;
-    *l -= o.x; *t -= o.y;
-    if (r) { *r -= o.x; *b -= o.y; }
+    (void)l; (void)t; (void)r; (void)b;
 }
 
 /* Clip a src rect and a dst position to both surfaces; 0 if nothing is left. */
