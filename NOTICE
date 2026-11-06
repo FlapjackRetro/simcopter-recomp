@@ -1,0 +1,12 @@
+SimCopter recomp
+
+SimCopter is (c) 1996-1997 Maxis, Inc., now Electronic Arts. This repository
+contains none of the game's code or data. Bring your own copy.
+
+Built on pcrecomp (https://github.com/sp00nznet/pcrecomp), MIT.
+
+The host runtime (src/runtime/: host.c, ddraw.c, present.c, oracle.c and their
+headers), run_lift.py, tools/catalog.py, tools/addr2line.py and build.cmd are
+adapted from the Streets of SimCity recomp
+(https://github.com/sp00nznet/streetsofsimcity), MIT License,
+Copyright (c) 2026 sp00nz. Streets of SimCity runs on the SimCopter engine.

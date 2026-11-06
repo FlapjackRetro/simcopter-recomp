@@ -1,0 +1,35 @@
+# Allow-list. The SimCopter disc (c) 1996-1997 Maxis is copied into this
+# folder's root for the local build, so everything is ignored except our own
+# project files below. Nothing from the game, and nothing lifted from it, is
+# ever committed.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/LICENSE
+!/NOTICE
+!/CMakeLists.txt
+!/build.cmd
+!/run_lift.py
+!/tools/
+!/src/
+!/docs/
+
+# Lifted output: a derivative work of the original binary
+/src/recomp/
+
+# Never inside the allowed folders either
+__pycache__/
+*.pyc
+*.exe
+*.EXE
+*.dll
+*.DLL
+*.iso
+*.ISO
+*.smk
+*.SC2
+*.sc2
+*.mp4
+*.bmp
+*.BMP
