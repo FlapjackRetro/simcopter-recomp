@@ -116,7 +116,35 @@ are already client-relative and the subtraction put the menu off the
 picture. `to_primary` no longer moves them. (Before these shims, the game's
 real-window coordinates and the host's subtraction had cancelled out.)
 
-## 8. Open questions for the first runs
+## 8. In game
+
+With the menu back, New Career Game loads the city and the helicopter flies on
+the software renderer, with no faults. Seen: the camera jitters now and then.
+Open: whether the shipping code does the same under this host (`--original`),
+which says a game behaviour (the main loop never sleeps, so it runs at many
+hundreds of frames a second) or a lift bug.
+
+## 9. Speed, jitter and the black lawn: the game's own
+
+`--original` first stopped at once: oracle.c expected Streets' 35 unbound
+Glide imports (`glide2x.dll`); SimCopter has 25 (`glide.dll`). With that
+fixed, the shipping code runs under the host too, and shows the same camera
+jitter and the same black lawn as the lift (not the lift's white speckles on
+it, still open). So those are the game on this machine, not the lift.
+
+It also overspeeds. The main loop (`sub_004308B0`) runs a frame per pass,
+the clock is `timeGetTime`, and a pass takes well under a millisecond here:
+everything advances per pass, and the camera moves on a clock that steps 1-16
+ms at a time. The host now paces the loop: the `PeekMessageA` that finds the
+queue empty, the end of a pass, waits for the next tick of `--fps` (default
+30, `--fps 0` as shipped), on the performance counter, with
+`timeBeginPeriod(1)`. Messages are not delayed.
+
+The black lawn: in flight 10-15 and 224-233 of the game's palette are black
+(`flags 05`), and only the static colours come from the system palette, so it
+is not the stale-palette idea. F12 (`palette-N.txt`) is the tool for it.
+
+## 10. Open questions
 
 - Whether the Glide probe is `grGlideInit` + `grSstQueryHardware` as the
   imports suggest, and what the game does when it answers "none".

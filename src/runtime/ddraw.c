@@ -836,6 +836,41 @@ static int WINAPI smack_StretchDIBits(HDC dc, int x, int y, int w, int h, int sx
     return StretchDIBits(dc, x, y, w, h, sx, sy, sw, sh, bits, bi, usage, rop);
 }
 
+/* F12 (present.c): what the screen is made of right now. For each of the 256
+ * indices: how many pixels of the primary use it, the primary's DirectDraw
+ * palette entry and the system palette the host answers GetSystemPaletteEntries
+ * with. Written next to the game (its current folder) as palette-N.txt, with
+ * the picture as palette-N.bmp. */
+void ddh_dump_palette(void) {
+    static int n;
+    char path[64];
+    Surface* s = g_primary;
+    if (!s || s->bpp != 8) { fprintf(stderr, "[palette] no 8-bit primary\n"); return; }
+    uint32_t hist[256] = { 0 };
+    EnterCriticalSection(&g_lock);
+    for (int y = 0; y < s->h; y++)
+        for (int x = 0; x < s->w; x++) hist[s->bits[(size_t)y * s->pitch + x]]++;
+    LeaveCriticalSection(&g_lock);
+    n++;
+    snprintf(path, sizeof path, "palette-%d.txt", n);
+    FILE* f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "[palette] cannot write %s\n", path); return; }
+    fprintf(f, "frame %ld; primary palette %p\nidx  pixels  primary(r g b flags)  syspal(r g b flags)\n",
+            g_frames, (void*)s->pal);
+    for (int i = 0; i < 256; i++) {
+        PALETTEENTRY p = s->pal ? s->pal->e[i] : (PALETTEENTRY){ 0 };
+        PALETTEENTRY q = g_sys_pal[i];
+        fprintf(f, "%3d %7u   %3u %3u %3u %02X       %3u %3u %3u %02X%s\n", i, hist[i],
+                p.peRed, p.peGreen, p.peBlue, p.peFlags, q.peRed, q.peGreen, q.peBlue, q.peFlags,
+                p.peRed < 40 && p.peGreen > 200 && p.peBlue < 40 ? "   <- green" : "");
+    }
+    fclose(f);
+    shadow_from_primary();
+    snprintf(path, sizeof path, "palette-%d.bmp", n);
+    save_bmp(path);
+    fprintf(stderr, "[palette] wrote palette-%d.txt\n", n);
+}
+
 /* Point a native module's imports of these names at the host's. */
 void ddh_hook_module(const char* dll) {
     static const struct { const char* name; void* fn; } hooks[] = {

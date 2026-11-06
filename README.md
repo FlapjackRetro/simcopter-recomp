@@ -11,7 +11,7 @@ was built on, and that recomp already drives its cities on the software
 renderer. This project starts from its host and lift driver (see
 [NOTICE](NOTICE)).
 
-## Status: bring-up — lifted, boots to the CD check
+## Status: bring-up — in game, flying on the software renderer
 
 | Stage | State |
 |---|---|
@@ -21,10 +21,9 @@ renderer. This project starts from its host and lift driver (see
 | Function catalog (`tools/catalog.py`) | 6,753 functions, 96.3% of `.text` |
 | Lift (`run_lift.py`) | 6,753 functions, 2.2M lines of C, **0 lift errors** |
 | Build | builds with MSVC 2022 (x86) |
-| Boot: CRT, start-up | runs to the CD check |
-| CD check | found ([bringup.md](docs/bringup.md) 5); fix under test |
-| DirectDraw | not yet |
-| Intro video (Smacker), menus, flying | not yet |
+| CD check | passes: `game\` offered as the CD ([bringup.md](docs/bringup.md) 5) |
+| Intro video (Smacker), menus | framed, in a scaled window ([bringup.md](docs/bringup.md) 6-7) |
+| New Career Game: into the city, flying | works; camera jitters ([bringup.md](docs/bringup.md) 8) |
 | v1.02 (`Upgr1.2\Simcopter102.exe`) | not targeted yet ([bringup.md](docs/bringup.md) 4) |
 
 ## Getting started

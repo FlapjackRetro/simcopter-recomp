@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <commdlg.h>
+#include <mmsystem.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -345,6 +346,44 @@ static void shim_GetSystemMetrics(void) {
     RET(GetSystemMetrics(i), 1);
 }
 
+/* The frame pace. The game simulates once per pass of its main loop
+ * (sub_004308B0: PeekMessageA until the queue is empty, then the frame), and
+ * its clock is timeGetTime. On a 1997 machine that was 15-30 passes a second;
+ * here it is thousands, and the helicopter, the traffic and the camera all
+ * advance per pass: the game overspeeds, and the camera jitters on a clock
+ * that moves in 1-16 ms steps under sub-millisecond frames. Flight sims of the
+ * era were fixed the same way: hold the loop to a steady rate. So the
+ * PeekMessageA that finds the queue empty, the end of one pass, waits for the
+ * next tick of --fps (default 30; 0: unpaced, as shipped). Messages still go
+ * through at once. Also the guest's timer resolution is 1 ms
+ * (timeBeginPeriod). docs/bringup.md 9. */
+static int g_fps = 30;
+static void pace(void) {
+    static LARGE_INTEGER freq, next;
+    LARGE_INTEGER now;
+    if (g_fps <= 0) return;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LONGLONG step = freq.QuadPart / g_fps;
+    QueryPerformanceCounter(&now);
+    if (!next.QuadPart || now.QuadPart - next.QuadPart > 4 * step) next = now;   /* a stall: start over */
+    while (now.QuadPart < next.QuadPart) {
+        LONGLONG ms = (next.QuadPart - now.QuadPart) * 1000 / freq.QuadPart;
+        Sleep(ms > 1 ? (DWORD)(ms - 1) : 0);
+        QueryPerformanceCounter(&now);
+    }
+    next.QuadPart += step;
+}
+
+static void shim_PeekMessageA(void) {
+    MSG* m = (MSG*)(uintptr_t)ARG(0);
+    BOOL r;
+    mach_leave();                        /* the window procedure may run */
+    r = PeekMessageA(m, (HWND)(uintptr_t)ARG(1), ARG(2), ARG(3), ARG(4));
+    if (!r) pace();
+    mach_enter();
+    RET(r, 5);
+}
+
 /* After AddFontResourceA the game tells every window with
  * SendMessageA(HWND_BROADCAST, WM_FONTCHANGE) (Streets does; kept in case
  * SimCopter does too), which waits on
@@ -411,6 +450,7 @@ static native32_shim_t g_shims[] = {
     { "GetWindowRect", shim_GetWindowRect },
     { "ClientToScreen", shim_ClientToScreen },
     { "GetSystemMetrics", shim_GetSystemMetrics },
+    { "PeekMessageA", shim_PeekMessageA },
     { "_grSstQueryHardware@4", shim_grSstQueryHardware },
     { "_grGlideInit@0", shim_grGlideInit },
     { "_grGlideShutdown@0", shim_grGlideShutdown },
@@ -542,6 +582,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fps") && i + 1 < argc) g_fps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--game") && i + 1 < argc) game = argv[++i];
         else if (!strcmp(argv[i], "--open") && i + 1 < argc) GetFullPathNameA(argv[++i], MAX_PATH, g_open, NULL);
         else if (!strcmp(argv[i], "--watchdog") && i + 1 < argc) g_watchdog_s = strtoul(argv[++i], NULL, 0);
@@ -555,7 +596,7 @@ int main(int argc, char** argv) {
         else {
             printf("usage: sco [--run] [--headless] [--record out.mp4] [--frames N]\n"
                    "             [--shot N:file.bmp] [--diff A,B] [--key NAME@MS[+HOLD]] [--click X,Y@MS]\n"
-                   "             [--scale N] [--game game] [--watchdog S] [--native-trace]\n"
+                   "             [--scale N] [--fps N] [--game game] [--watchdog S] [--native-trace]\n"
                    "             [--callbacks] [--ddraw-trace] [--original [--lifted VA,...]]\n");
             recomp_trace_help();
             return argv[i][1] == 'h' || argv[i][2] == 'h' ? 0 : 1;
@@ -566,6 +607,8 @@ int main(int argc, char** argv) {
     _snprintf(g_guest_exe, sizeof g_guest_exe - 1, "%sSimCopter.exe", g_game);
     _snprintf(g_guest_cmdline, sizeof g_guest_cmdline - 1, "\"%s\"", g_guest_exe);
 
+    timeBeginPeriod(1);                  /* the guest's timeGetTime, and pace()'s Sleep */
+    if (g_fps > 0) printf("[pace] main loop held to %d fps (--fps N; 0 = unpaced)\n", g_fps);
     o.headless = g_headless;
     o.scale = scale;
     ddh_init(&o);

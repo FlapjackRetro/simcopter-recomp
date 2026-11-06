@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "present.h"
+void ddh_dump_palette(void);   /* ddraw.c: F12 */
 
 #define VW 640
 #define VH 480
@@ -510,6 +511,7 @@ int present_message(HWND h, UINT m, WPARAM w, LPARAM* l, LRESULT* r) {
     switch (m) {
     case WM_KEYDOWN:
         if (w == VK_F11) { set_fullscreen(!g_full); return 1; }
+        if (w == VK_F12) { ddh_dump_palette(); return 1; }     /* docs/bringup.md 9 */
         if (w == VK_ESCAPE && g_full) { set_fullscreen(0); return 1; }
         return 0;
     case WM_SYSKEYDOWN:

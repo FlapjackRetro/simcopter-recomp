@@ -44,4 +44,8 @@ void ddh_hook_module(const char* dll);   /* a native DLL that draws into the gam
     { "RealizePalette", ddh_shim_RealizePalette }, \
     { "GetSystemPaletteEntries", ddh_shim_GetSystemPaletteEntries }
 
+/* F12: write the primary's palette, the system palette the host reports and
+ * the primary's index histogram to palette-N.txt (and palette-N.bmp). */
+void ddh_dump_palette(void);
+
 #endif

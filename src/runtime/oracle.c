@@ -101,8 +101,12 @@ static int bind(uint32_t base, native32_shim_t* shims, int nshims) {
         }
     }
     printf("[original] imports: %d native, %d shimmed, %d unresolved\n", native, shimmed, missing);
-    /* glide2x.dll's other 35, with no Voodoo: unused by the software renderer (host.c) */
-    return missing == 35 && !GetModuleHandleA("glide2x.dll") ? 0 : missing;
+    /* glide.dll's 25 not shimmed, with no Voodoo: unused by the software
+     * renderer (host.c, "Glide"). Streets' check here was glide2x.dll's 35,
+     * which made --original stop silently on SimCopter. */
+    if (missing == 25 && !GetModuleHandleA("glide.dll")) return 0;
+    fprintf(stderr, "[original] %d imports unresolved (expected 25 Glide ones without glide.dll)\n", missing);
+    return missing;
 }
 
 /* First-chance exceptions, logged and passed on: the original handles its
